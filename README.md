@@ -1,4 +1,4 @@
-# Telegram Bot Absensi Sales Force — Biringkanaya
+# Prediksi SF 
 
 PHP 8.1+ + MySQL 8 / MariaDB. Tanpa framework; perlu ekstensi `pdo_mysql` dan `curl`. Timezone absensi: Asia/Makassar (WITA). **Satu check-in per SF per hari.**
 
