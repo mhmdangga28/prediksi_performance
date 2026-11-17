@@ -1,0 +1,17 @@
+# Environment & credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor
+.vscode/
+
+# Generated files (jika hanya output sementara)
+# predictions/
+# hasil_evaluasi_io_v3/
