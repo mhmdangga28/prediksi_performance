@@ -74,12 +74,13 @@ try {
                 $chatId,
                 "👋 Selamat datang di Bot Absensi SF!\n\n"
                     . "📋 MENU\n\n"
-                    . "/daftar - Registrasi SF\n"
+                    . "/daftar - Registrasi SF + kode resmi\n"
                     . "/absen - Rencana aktivitas harian\n"
                     . "/status - Status kehadiran\n"
                     . "/pulang - Catat waktu pulang aktual\n"
                     . "/batal - Batalkan proses\n"
-                    . "/id - ID Telegram Anda\n\n"
+                    . "/id - ID Telegram Anda\n"
+                    . "/link SF001 KODE - Admin: tautkan akun lama\n\n"
                     . "Gunakan /daftar jika belum memiliki akun."
             );
         } elseif (preg_match('~^/id(?:@\w+)?$~i', $input)) {
@@ -99,13 +100,15 @@ try {
                         . "Status: {$sf['registration_status']}"
                 );
             } else {
-                saveSession($pdo, $userId, 'reg_name');
+                saveSession($pdo, $userId, 'reg_official_code');
 
                 sendMessage(
                     $chatId,
                     "📝 REGISTRASI SALES FORCE\n\n"
-                        . "Pertanyaan 1 dari 3\n\n"
-                        . "Siapa nama lengkap Anda?",
+                        . "Pertanyaan 1 dari 4\n\n"
+                        . "Masukkan KODE SF RESMI Telkomsel/KSS Anda.\n"
+                        . "Kode harus tercatat pada master KSS Makassar.\n\n"
+                        . "Contoh format: SUN5135643",
                     cancelKeyboard()
                 );
             }
@@ -128,6 +131,12 @@ try {
                     $chatId,
                     "Akun belum disetujui admin.\n"
                         . "Status: {$sf['registration_status']}"
+                );
+            } elseif (!mappedOfficialSf($pdo, (int)$sf['id'])) {
+                sendMessage(
+                    $chatId,
+                    "Akun belum terhubung ke kode SF resmi.\n"
+                        . "Hubungi admin untuk verifikasi mapping."
                 );
             } else {
                 $stmt = $pdo->prepare("
@@ -225,6 +234,49 @@ try {
             // ====================================
 
         } elseif (preg_match(
+            '~^/link(?:@\w+)?\s+(SF\d+)\s+([A-Z0-9.\-]+)$~i',
+            $input,
+            $matches
+        )) {
+            if (!isAdmin($userId)) {
+                sendMessage($chatId, 'Perintah ini hanya untuk admin.');
+            } else {
+                $botCode = strtoupper($matches[1]);
+                $official = findOfficialSf($pdo, $matches[2]);
+                $stmt = $pdo->prepare("SELECT id, full_name, registration_status FROM sales_force WHERE sf_code = ? LIMIT 1");
+                $stmt->execute([$botCode]);
+                $targetSf = $stmt->fetch();
+
+                if (!$targetSf || !$official) {
+                    sendMessage($chatId, 'Kode bot atau kode resmi KSS tidak ditemukan.');
+                } elseif ($targetSf['registration_status'] !== 'approved') {
+                    sendMessage($chatId, 'Perintah /link hanya untuk akun lama yang sudah approved.');
+                } else {
+                    try {
+                        $pdo->beginTransaction();
+                        $stmt = $pdo->prepare('SELECT telkomsel_sf_code FROM sf_code_mapping WHERE bot_sf_id = ? FOR UPDATE');
+                        $stmt->execute([(int)$targetSf['id']]);
+                        $existing = $stmt->fetchColumn();
+                        if ($existing !== false) {
+                            $pdo->rollBack();
+                            sendMessage($chatId, 'Kode bot sudah mempunyai mapping. Tidak ditimpa otomatis.');
+                        } elseif (officialCodeAlreadyMapped($pdo, $official['kode_sf'])) {
+                            $pdo->rollBack();
+                            sendMessage($chatId, 'Kode resmi sudah digunakan akun Telegram lain.');
+                        } else {
+                            $stmt = $pdo->prepare('INSERT INTO sf_code_mapping (bot_sf_id, telkomsel_sf_code) VALUES (?, ?)');
+                            $stmt->execute([(int)$targetSf['id'], $official['kode_sf']]);
+                            $pdo->commit();
+                            sendMessage($chatId, "✅ Mapping berhasil: {$botCode} → {$official['kode_sf']} ({$official['nama_sf']}).");
+                        }
+                    } catch (PDOException $ex) {
+                        if ($pdo->inTransaction()) $pdo->rollBack();
+                        sendMessage($chatId, 'Mapping gagal. Periksa keunikan kode dan log server.');
+                        error_log('SF /link: ' . $ex->getMessage());
+                    }
+                }
+            }
+        } elseif (preg_match(
             '~^/(approve|reject)(?:@\w+)?\s+(SF\d+)$~i',
             $input,
             $matches
@@ -232,50 +284,52 @@ try {
             if (!isAdmin($userId)) {
                 sendMessage($chatId, 'Perintah ini hanya untuk admin.');
             } else {
-                $status = strtolower($matches[1]) === 'approve'
-                    ? 'approved' : 'rejected';
+                $status = strtolower($matches[1]) === 'approve' ? 'approved' : 'rejected';
                 $code = strtoupper($matches[2]);
-
-                $stmt = $pdo->prepare("
-                    UPDATE sales_force
-                    SET registration_status = ?, active = ?
-                    WHERE sf_code = ?
-                      AND registration_status = 'pending'
-                ");
-
-                $stmt->execute([
-                    $status,
-                    $status === 'approved' ? 1 : 0,
-                    $code
-                ]);
-
-                if ($stmt->rowCount() === 1) {
-                    sendMessage(
-                        $chatId,
-                        "Status {$code} menjadi {$status}."
-                    );
-
-                    $stmt = $pdo->prepare("
-                        SELECT telegram_user_id
-                        FROM sales_force WHERE sf_code = ?
-                    ");
+                $target = 0;
+                $ok = false;
+                $reason = null;
+                try {
+                    $pdo->beginTransaction();
+                    $stmt = $pdo->prepare("SELECT id, telegram_user_id FROM sales_force WHERE sf_code = ? AND registration_status = 'pending' FOR UPDATE");
                     $stmt->execute([$code]);
-
-                    $target = (int)$stmt->fetchColumn();
-
-                    if ($target > 0) {
-                        sendMessage(
-                            $target,
-                            $status === 'approved'
-                                ? "✅ Registrasi {$code} disetujui. Ketik /absen."
-                                : "❌ Registrasi {$code} ditolak. Hubungi admin."
-                        );
+                    $pending = $stmt->fetch();
+                    if (!$pending) {
+                        $reason = 'Kode tidak ditemukan atau sudah diproses.';
+                    } else {
+                        $target = (int)$pending['telegram_user_id'];
+                        $official = mappedOfficialSf($pdo, (int)$pending['id']);
+                        if ($status === 'approved' && !$official) {
+                            $reason = 'Belum ada mapping kode SF resmi KSS yang valid. Jangan approve sebelum verifikasi.';
+                        } else {
+                            if ($status === 'rejected') {
+                                $stmt = $pdo->prepare('DELETE FROM sf_code_mapping WHERE bot_sf_id = ?');
+                                $stmt->execute([(int)$pending['id']]);
+                            }
+                            $stmt = $pdo->prepare('UPDATE sales_force SET registration_status = ?, active = ? WHERE id = ?');
+                            $stmt->execute([$status, $status === 'approved' ? 1 : 0, (int)$pending['id']]);
+                            $ok = true;
+                        }
                     }
+                    $pdo->commit();
+                } catch (Throwable $ex) {
+                    if ($pdo->inTransaction()) $pdo->rollBack();
+                    error_log('SF approve/reject: ' . $ex->getMessage());
+                    $reason = 'Operasi gagal. Periksa log server.';
+                }
+                if (!$ok) {
+                    sendMessage($chatId, $reason ?: 'Operasi tidak dapat diproses.');
                 } else {
-                    sendMessage(
-                        $chatId,
-                        'Kode tidak ditemukan atau sudah diproses.'
-                    );
+                    sendMessage($chatId, "Status {$code} menjadi {$status}.");
+                    if ($target > 0) {
+                        try {
+                            sendMessage($target, $status === 'approved'
+                                ? "✅ Registrasi {$code} disetujui. Ketik /absen."
+                                : "❌ Registrasi {$code} ditolak. Hubungi admin.");
+                        } catch (Throwable $ex) {
+                            error_log('Notifikasi keputusan registrasi gagal: ' . $ex->getMessage());
+                        }
+                    }
                 }
             }
 
@@ -299,14 +353,47 @@ try {
             } else {
                 $data = $session['data'];
                 $data['planned_end_time'] = $time;
-                saveSession($pdo, $userId, 'att_area', $data);
-                sendMessage($chatId, "3/3 Di wilayah mana Anda BERENCANA berjualan hari ini?", areaKeyboard($pdo));
+                $access = $sf && $sf['registration_status'] === 'approved' && (int)$sf['active'] === 1
+                    ? sfAllowedAreas($pdo, (int)$sf['id'])
+                    : ['context' => ['ok' => false, 'reason' => 'Akun belum aktif.'], 'areas' => []];
+                if (!$access['context']['ok']) {
+                    clearSession($pdo, $userId);
+                    sendMessage($chatId, "⚠️ Wilayah belum tersedia. " . $access['context']['reason'] . "\nUlangi /absen setelah diperbaiki.");
+                } else {
+                    saveSession($pdo, $userId, 'att_area', $data);
+                    $context = $access['context'];
+                    $sourceLabel = $context['source'] === 'VERIFIED' ? 'Penempatan terverifikasi' : 'DJP terbaru (sementara)';
+                    sendMessage(
+                        $chatId,
+                        "3/3 Di wilayah mana Anda BERENCANA berjualan hari ini?\n\n" .
+                            "WOK: {$context['wok']}\nSumber: {$sourceLabel}",
+                        areaKeyboard($pdo, (int)$sf['id'])
+                    );
+                }
             }
 
             // ====================================
             // INPUT NAMA
             // ====================================
 
+        } elseif ($session && $session['step'] === 'reg_official_code') {
+            $official = findOfficialSf($pdo, $input);
+            if (!$official) {
+                sendMessage($chatId, 'Kode SF resmi tidak ditemukan pada master KSS Makassar. Periksa kode atau hubungi admin.', cancelKeyboard());
+            } elseif (officialCodeAlreadyMapped($pdo, $official['kode_sf'])) {
+                sendMessage($chatId, 'Kode SF resmi ini sudah digunakan akun bot lain. Hubungi admin.', cancelKeyboard());
+            } else {
+                saveSession($pdo, $userId, 'reg_name', [
+                    'official_code' => $official['kode_sf'],
+                    'official_name' => $official['nama_sf']
+                ]);
+                sendMessage(
+                    $chatId,
+                    "Pertanyaan 2 dari 4\n\nMasukkan nama lengkap Anda.\n"
+                        . "Nama pada master: {$official['nama_sf']}",
+                    cancelKeyboard()
+                );
+            }
         } elseif ($session && $session['step'] === 'reg_name') {
             if (
                 str_starts_with($input, '/') ||
@@ -333,12 +420,12 @@ try {
                         $pdo,
                         $userId,
                         'reg_agency',
-                        ['name' => $input]
+                        array_merge($session['data'], ['name' => $input])
                     );
 
                     sendMessage(
                         $chatId,
-                        "Pertanyaan 2 dari 3\n\n"
+                        "Pertanyaan 3 dari 4\n\n"
                             . "Anda tergabung dalam Agency mana?",
                         $keyboard
                     );
@@ -388,6 +475,7 @@ try {
                         $chatId,
                         "📝 KONFIRMASI PENDAFTARAN\n\n"
                             . "Nama: {$data['name']}\n"
+                            . "Kode SF resmi: {$data['official_code']}\n"
                             . "Agency: {$data['agency_name']}\n"
                             . "Telepon: {$data['phone']}\n\n"
                             . "Kode SF akan dibuat otomatis.\n"
@@ -468,7 +556,8 @@ try {
             $session['step'] === 'att_present' &&
             $sf &&
             $sf['registration_status'] === 'approved' &&
-            (int)$sf['active'] === 1
+            (int)$sf['active'] === 1 &&
+            mappedOfficialSf($pdo, (int)$sf['id']) !== null
         ) {
             saveSession($pdo, $userId, 'att_start');
             answerCallback($cbId, 'Isi rencana kerja.');
@@ -483,20 +572,13 @@ try {
             $session['step'] === 'att_area' &&
             $sf &&
             $sf['registration_status'] === 'approved' &&
-            (int)$sf['active'] === 1
+            (int)$sf['active'] === 1 &&
+            mappedOfficialSf($pdo, (int)$sf['id']) !== null
         ) {
-            $stmt = $pdo->prepare("
-                SELECT id, area_name
-                FROM work_areas
-                WHERE id = ? AND active = 1
-                LIMIT 1
-            ");
-
-            $stmt->execute([(int)$m[1]]);
-            $area = $stmt->fetch();
+            $area = sfAllowedArea($pdo, (int)$sf['id'], (int)$m[1]);
 
             if (!$area) {
-                answerCallback($cbId, 'Wilayah tidak tersedia.');
+                answerCallback($cbId, 'Wilayah tidak diizinkan untuk WOK Anda.');
             } else {
                 $data = $session['data'];
                 $data['area_id'] = (int)$area['id'];
@@ -520,7 +602,8 @@ try {
         } elseif (
             $action === 'att:confirm' &&
             $session['step'] === 'att_confirm' &&
-            $sf && $sf['registration_status'] === 'approved' && (int)$sf['active'] === 1
+            $sf && $sf['registration_status'] === 'approved' && (int)$sf['active'] === 1 &&
+            mappedOfficialSf($pdo, (int)$sf['id']) !== null
         ) {
             $data = $session['data'];
             $start = $data['planned_start_time'] ?? null;
@@ -536,13 +619,11 @@ try {
                 answerCallback($cbId, 'Data absensi tidak lengkap.');
                 sendMessage($chatId, 'Data tidak valid. Silakan mulai ulang /absen.');
             } else {
-                $stmt = $pdo->prepare('SELECT id, area_name FROM work_areas WHERE id = ? AND active = 1 LIMIT 1');
-                $stmt->execute([$areaId]);
-                $area = $stmt->fetch();
+                $area = sfAllowedArea($pdo, (int)$sf['id'], $areaId);
 
                 if (!$area) {
-                    answerCallback($cbId, 'Wilayah tidak aktif.');
-                    sendMessage($chatId, 'Wilayah sudah tidak aktif. Gunakan /batal lalu ulangi /absen.', cancelKeyboard());
+                    answerCallback($cbId, 'Wilayah tidak diizinkan.');
+                    sendMessage($chatId, 'Wilayah tidak sesuai penempatan/WOK yang berlaku. Gunakan /batal lalu ulangi /absen.', cancelKeyboard());
                 } else {
                     $now = new DateTimeImmutable('now', new DateTimeZone('Asia/Makassar'));
                     // Unique (sf_id, attendance_date) harus ada untuk mencegah duplikasi.
@@ -652,6 +733,14 @@ try {
                     $data['phone']
                 ]);
 
+                $newBotSfId = (int)$pdo->lastInsertId();
+                $official = findOfficialSf($pdo, (string)($data['official_code'] ?? ''));
+                if (!$official || officialCodeAlreadyMapped($pdo, $official['kode_sf'])) {
+                    throw new RuntimeException('Kode SF resmi tidak lagi tersedia; silakan daftar ulang.');
+                }
+                $stmt = $pdo->prepare('INSERT INTO sf_code_mapping (bot_sf_id, telkomsel_sf_code) VALUES (?, ?)');
+                $stmt->execute([$newBotSfId, $official['kode_sf']]);
+
                 clearSession($pdo, $userId);
                 $pdo->commit();
 
@@ -661,7 +750,8 @@ try {
                     $chatId,
                     "✅ REGISTRASI BERHASIL DIKIRIM\n\n"
                         . "Nama: {$data['name']}\n"
-                        . "Kode SF: {$sfCode}\n"
+                        . "Kode bot: {$sfCode}\n"
+                        . "Kode resmi: {$data['official_code']}\n"
                         . "Agency: {$data['agency_name']}\n"
                         . "Status: Menunggu Verifikasi Admin\n\n"
                         . "Anda dapat mengecek status melalui /status."
@@ -681,8 +771,10 @@ try {
                             sendMessage(
                                 (int)$adminId,
                                 "📝 REGISTRASI SF BARU\n\n"
-                                    . "Kode: {$sfCode}\n"
-                                    . "Nama: {$data['name']}\n"
+                                    . "Kode bot: {$sfCode}\n"
+                                    . "Kode resmi: {$data['official_code']}\n"
+                                    . "Nama master: {$data['official_name']}\n"
+                                    . "Nama pendaftar: {$data['name']}\n"
                                     . "Agency: {$data['agency_name']}\n\n"
                                     . "/approve {$sfCode}\n"
                                     . "/reject {$sfCode}"

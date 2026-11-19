@@ -199,35 +199,107 @@ function presentKeyboard(): array
 // PILIH WILAYAH DINAMIS
 // ========================================
 
-function areaKeyboard(PDO $pdo): array
+/**
+ * Tentukan WOK akun SF.
+ * Prioritas: penempatan verified yang berlaku pada hari absensi;
+ * fallback: kandidat tugas DJP terbaru (belum diverifikasi).
+ * Tidak pernah membuka semua wilayah jika data penempatan kosong.
+ */
+function sfAreaContext(PDO $pdo, int $botSfId, ?string $date = null): array
 {
-    $stmt = $pdo->query("
-        SELECT id, area_name
-        FROM work_areas
-        WHERE active = 1
-        ORDER BY area_name ASC
-    ");
+    $date = $date ?? attendanceDate();
+    $official = mappedOfficialSf($pdo, $botSfId);
+    if (!$official) {
+        return ['ok' => false, 'reason' => 'Kode SF resmi belum terhubung atau tidak valid.'];
+    }
+    $code = strtoupper(trim((string)$official['kode_sf']));
 
+    $stmt = $pdo->prepare("\n        SELECT cluster, wok, effective_date\n        FROM sf_work_assignments\n        WHERE UPPER(TRIM(kode_sf)) COLLATE utf8mb4_unicode_ci = ?\n          AND verification_status = 'verified'\n          AND effective_date <= ?\n          AND (end_date IS NULL OR end_date >= ?)\n        ORDER BY effective_date DESC, id DESC\n        LIMIT 1\n    ");
+    $stmt->execute([$code, $date, $date]);
+    $record = $stmt->fetch();
+    if ($record) {
+        $wok = strtoupper(trim((string)($record['wok'] ?? '')));
+        if ($wok === '' || $wok === '-') {
+            return ['ok' => false, 'reason' => 'Penempatan terverifikasi belum memiliki WOK. Hubungi admin.'];
+        }
+        return [
+            'ok' => true,
+            'kode_sf' => $code,
+            'cluster' => $record['cluster'],
+            'wok' => $wok,
+            'source' => 'VERIFIED'
+        ];
+    }
+
+    // Saat belum ada verifikasi, ambil WOK dari tugas DJP TERBARU.
+    // Semua tugas pada tanggal terbaru ditinjau untuk mencegah konflik WOK.
+    $stmt = $pdo->prepare("\n        SELECT DISTINCT UPPER(TRIM(COALESCE(wok, ''))) AS wok,\n                        UPPER(TRIM(COALESCE(cluster, ''))) AS cluster\n        FROM sf_djp_assignments\n        WHERE UPPER(TRIM(kode_sf)) COLLATE utf8mb4_unicode_ci = ?\n          AND assignment_date = (\n              SELECT MAX(assignment_date)\n              FROM sf_djp_assignments\n              WHERE UPPER(TRIM(kode_sf)) COLLATE utf8mb4_unicode_ci = ?\n                AND assignment_date <= ?\n          )\n    ");
+    $stmt->execute([$code, $code, $date]);
+    $records = $stmt->fetchAll();
+    if (!$records) {
+        return ['ok' => false, 'reason' => 'Belum ada tugas DJP/penempatan untuk SF ini. Hubungi admin.'];
+    }
+    $woks = [];
+    foreach ($records as $row) {
+        $value = trim($row['wok'] ?? '');
+        if ($value !== '' && $value !== '-') $woks[$value] = true;
+    }
+    if (count($woks) !== 1 || count($records) > 1) {
+        return ['ok' => false, 'reason' => 'WOK DJP terakhir kosong atau tidak konsisten. Perlu verifikasi admin.'];
+    }
+    return [
+        'ok' => true,
+        'kode_sf' => $code,
+        'cluster' => $records[0]['cluster'],
+        'wok' => array_key_first($woks),
+        'source' => 'DJP_SEMENTARA'
+    ];
+}
+
+/** Daftar area yang memang dipetakan ke WOK dan aktif. */
+function sfAllowedAreas(PDO $pdo, int $botSfId, ?string $date = null): array
+{
+    $context = sfAreaContext($pdo, $botSfId, $date);
+    if (!$context['ok']) {
+        return ['context' => $context, 'areas' => []];
+    }
+    $stmt = $pdo->prepare("\n        SELECT a.id, a.area_name\n        FROM sf_wok_area_map map\n        JOIN work_areas a ON a.id = map.area_id\n        WHERE UPPER(TRIM(map.wok)) COLLATE utf8mb4_unicode_ci = ?\n          AND map.active = 1 AND a.active = 1\n        ORDER BY a.area_name\n    ");
+    $stmt->execute([$context['wok']]);
+    $areas = $stmt->fetchAll();
+    if (!$areas) {
+        $context = ['ok' => false, 'reason' => 'WOK ' . $context['wok'] . ' belum memiliki area yang diizinkan. Hubungi admin.'];
+    }
+    return ['context' => $context, 'areas' => $areas];
+}
+
+/** Tombol wilayah hanya untuk akun SF bersangkutan. */
+function areaKeyboard(PDO $pdo, int $botSfId): array
+{
+    $access = sfAllowedAreas($pdo, $botSfId);
     $keyboard = [];
     $row = [];
-
-    foreach ($stmt->fetchAll() as $area) {
+    foreach ($access['areas'] as $area) {
         $row[] = [
             'text' => '📍 ' . $area['area_name'],
             'callback_data' => 'att:area:' . $area['id']
         ];
-
         if (count($row) === 2) {
             $keyboard[] = $row;
             $row = [];
         }
     }
-
-    if ($row) {
-        $keyboard[] = $row;
-    }
-
+    if ($row) $keyboard[] = $row;
     return [...$keyboard, ...cancelKeyboard()];
+}
+
+/** Cek area terhadap WOK saat callback dan saat simpan. */
+function sfAllowedArea(PDO $pdo, int $botSfId, int $areaId, ?string $date = null): ?array
+{
+    $access = sfAllowedAreas($pdo, $botSfId, $date);
+    foreach ($access['areas'] as $area) {
+        if ((int)$area['id'] === $areaId) return $area;
+    }
+    return null;
 }
 
 // ========================================
@@ -265,7 +337,7 @@ function sendContactPrompt(int $chatId): void
 {
     telegramApi('sendMessage', [
         'chat_id' => $chatId,
-        'text' => "3/3 Silakan bagikan nomor telepon Anda.\n\n"
+        'text' => "4/4 Silakan bagikan nomor telepon Anda.\n\n"
             . "Tekan Batalkan jika tidak ingin melanjutkan.",
         'reply_markup' => [
             'keyboard' => [
@@ -315,6 +387,58 @@ function registeredSf(PDO $pdo, int $userId): ?array
     $stmt->execute([$userId]);
 
     return $stmt->fetch() ?: null;
+}
+
+// ========================================
+// IDENTITAS SF RESMI TELKOMSEL
+// ========================================
+
+function findOfficialSf(PDO $pdo, string $code): ?array
+{
+    $code = strtoupper(trim($code));
+    if (!preg_match('/^[A-Z0-9.\-]{3,80}$/', $code)) {
+        return null;
+    }
+
+    $stmt = $pdo->prepare("
+        SELECT kode_sf, nama_sf, branch, company_name, cluster
+        FROM sf_master_telkomsel
+        WHERE UPPER(TRIM(kode_sf)) COLLATE utf8mb4_unicode_ci = ?
+          AND UPPER(TRIM(branch)) = 'MAKASSAR'
+          AND UPPER(company_name) LIKE '%KINARYA%'
+        LIMIT 1
+    ");
+    $stmt->execute([$code]);
+    return $stmt->fetch() ?: null;
+}
+
+function mappedOfficialSf(PDO $pdo, int $botSfId): ?array
+{
+    $stmt = $pdo->prepare("
+        SELECT t.kode_sf, t.nama_sf, t.cluster
+        FROM sf_code_mapping m
+        JOIN sf_master_telkomsel t
+          ON UPPER(TRIM(t.kode_sf)) COLLATE utf8mb4_unicode_ci =
+             UPPER(TRIM(m.telkomsel_sf_code)) COLLATE utf8mb4_unicode_ci
+        WHERE m.bot_sf_id = ?
+          AND UPPER(TRIM(t.branch)) = 'MAKASSAR'
+          AND UPPER(t.company_name) LIKE '%KINARYA%'
+        LIMIT 1
+    ");
+    $stmt->execute([$botSfId]);
+    return $stmt->fetch() ?: null;
+}
+
+function officialCodeAlreadyMapped(PDO $pdo, string $code, ?int $exceptBotSfId = null): bool
+{
+    $stmt = $pdo->prepare("
+        SELECT 1 FROM sf_code_mapping
+        WHERE UPPER(TRIM(telkomsel_sf_code)) COLLATE utf8mb4_unicode_ci = ?
+          AND (? IS NULL OR bot_sf_id <> ?)
+        LIMIT 1
+    ");
+    $stmt->execute([strtoupper(trim($code)), $exceptBotSfId, $exceptBotSfId]);
+    return (bool)$stmt->fetchColumn();
 }
 
 // ========================================
